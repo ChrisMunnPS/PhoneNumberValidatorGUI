@@ -41,7 +41,10 @@ function Get-NuGetPackageDll {
         Downloads a NuGet package's .nupkg from nuget.org's flat-container API,
         extracts the DLL(s) for the requested target framework folder, and
         copies them into the local cache. Returns the full paths of the DLLs
-        copied. Uses the newest published version of the package.
+        copied. Uses the newest published STABLE version of the package -
+        the flat-container index lists prerelease/RC versions too, and those
+        are deliberately excluded here since they're not meant for production
+        use and have caused problems (e.g. non-standard assembly layouts).
     #>
     param(
         [Parameter(Mandatory)][string]$PackageId,
@@ -52,9 +55,10 @@ function Get-NuGetPackageDll {
     $idLower = $PackageId.ToLowerInvariant()
     $indexUrl = "https://api.nuget.org/v3-flatcontainer/$idLower/index.json"
 
-    Write-Host "Resolving latest version of $PackageId ..."
+    Write-Host "Resolving latest stable version of $PackageId ..."
     $index = Invoke-RestMethod -Uri $indexUrl -UseBasicParsing
-    $version = $index.versions | Select-Object -Last 1
+    $stableVersions = $index.versions | Where-Object { $_ -notmatch '-' }
+    $version = if ($stableVersions) { $stableVersions | Select-Object -Last 1 } else { $index.versions | Select-Object -Last 1 }
 
     $nupkgUrl = "https://api.nuget.org/v3-flatcontainer/$idLower/$version/$idLower.$version.nupkg"
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("nuget_" + [guid]::NewGuid().ToString('N'))
@@ -95,7 +99,7 @@ function Initialize-PhoneNumbersLibrary {
         # Windows PowerShell 5.1 needs the netstandard2.0 build plus two
         # small polyfill dependency assemblies.
         $framework = 'netstandard2.0'
-        $requiredDlls = @('PhoneNumbers.dll', 'System.Memory.dll', 'System.Collections.Immutable.dll')
+        $requiredDlls = @('System.Memory.dll', 'System.Collections.Immutable.dll', 'PhoneNumbers.dll')
     }
 
     $missing = $requiredDlls | Where-Object { -not (Test-Path (Join-Path $script:CacheDir $_)) }
@@ -120,6 +124,51 @@ function Initialize-PhoneNumbersLibrary {
         }
     }
 
+    # Windows PowerShell 5.1 loads assemblies passed to Add-Type via
+    # Assembly.LoadFrom, which puts them in the "LoadFrom" binding context.
+    # When PhoneNumbers.dll (also loaded that way) then asks the CLR for its
+    # System.Memory / System.Collections.Immutable references, normal probing
+    # runs in a different context and doesn't find them - even though the
+    # files are sitting right there in lib\ - and throws FileNotFoundException.
+    # An AssemblyResolve handler is the standard fix: it catches any bind the
+    # CLR couldn't resolve normally and hands back our cached copy directly,
+    # regardless of exact version or which context asked for it.
+    #
+    # Guarded against re-entrant requests for the same assembly name: if
+    # loading a candidate DLL itself triggers another resolve request for
+    # that same name (seen with some mismatched dependency builds), retrying
+    # would recurse indefinitely and crash with a StackOverflowException,
+    # which can't be caught. Refusing the second request for the same name
+    # breaks that chain; PhoneNumbers.dll will then fail its call cleanly
+    # with a normal, catchable error instead of crashing the process.
+    #
+    # Deliberately uses $script: scope rather than local variables/closures:
+    # AssemblyResolve is raised by the CLR loader itself, not through
+    # PowerShell's own event plumbing (unlike WPF's Add_Click), so a plain
+    # scriptblock cast to a delegate here does NOT carry local variables with
+    # it - only script-scope resolves correctly when invoked this way.
+    $script:ResolveInProgress = New-Object System.Collections.Generic.HashSet[string]
+    $resolver = [System.ResolveEventHandler] {
+        param($resolveSender, $resolveArgs)
+        $requestedName = ([System.Reflection.AssemblyName]$resolveArgs.Name).Name
+        if (-not $script:ResolveInProgress.Add($requestedName)) {
+            return $null
+        }
+        try {
+            $candidatePath = Join-Path $script:CacheDir "$requestedName.dll"
+            if (Test-Path $candidatePath) {
+                return [System.Reflection.Assembly]::LoadFrom($candidatePath)
+            }
+            return $null
+        }
+        finally {
+            [void]$script:ResolveInProgress.Remove($requestedName)
+        }
+    }
+    [System.AppDomain]::CurrentDomain.add_AssemblyResolve($resolver)
+
+    # Load dependencies before the assembly that references them, as extra
+    # insurance on top of the resolver above.
     foreach ($dll in $requiredDlls) {
         Add-Type -Path (Join-Path $script:CacheDir $dll)
     }
