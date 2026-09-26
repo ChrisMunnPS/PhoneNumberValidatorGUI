@@ -35,16 +35,58 @@ $script:CacheDir = Join-Path $PSScriptRoot 'lib'
 if (-not (Test-Path $script:CacheDir)) {
     New-Item -ItemType Directory -Path $script:CacheDir -Force | Out-Null
 }
+$script:VersionsPath = Join-Path $script:CacheDir 'versions.json'
+
+function Get-InstalledPackageVersions {
+    <# Returns a hashtable of PackageId -> installed version, from versions.json. #>
+    $result = @{}
+    if (Test-Path $script:VersionsPath) {
+        try {
+            $obj = Get-Content -Path $script:VersionsPath -Raw | ConvertFrom-Json
+            foreach ($prop in $obj.PSObject.Properties) {
+                $result[$prop.Name] = $prop.Value
+            }
+        }
+        catch { }
+    }
+    return $result
+}
+
+function Set-InstalledPackageVersion {
+    param([Parameter(Mandatory)][string]$PackageId, [Parameter(Mandatory)][string]$Version)
+    try {
+        $versions = Get-InstalledPackageVersions
+        $versions[$PackageId] = $Version
+        $versions | ConvertTo-Json | Set-Content -Path $script:VersionsPath -Encoding UTF8
+    }
+    catch { }
+}
+
+function Get-LatestStableNuGetVersion {
+    <#
+        Returns the newest published STABLE version string for a NuGet
+        package - the flat-container index lists prerelease/RC versions
+        too, and those are deliberately excluded since they're not meant
+        for production use and have caused problems (e.g. non-standard
+        assembly layouts).
+    #>
+    param([Parameter(Mandatory)][string]$PackageId)
+    $idLower = $PackageId.ToLowerInvariant()
+    $indexUrl = "https://api.nuget.org/v3-flatcontainer/$idLower/index.json"
+    $index = Invoke-RestMethod -Uri $indexUrl -UseBasicParsing
+    $stableVersions = $index.versions | Where-Object { $_ -notmatch '-' }
+    if ($stableVersions) { return ($stableVersions | Select-Object -Last 1) }
+    return ($index.versions | Select-Object -Last 1)
+}
 
 function Get-NuGetPackageDll {
     <#
         Downloads a NuGet package's .nupkg from nuget.org's flat-container API,
         extracts the DLL(s) for the requested target framework folder, and
         copies them into the local cache. Returns the full paths of the DLLs
-        copied. Uses the newest published STABLE version of the package -
-        the flat-container index lists prerelease/RC versions too, and those
-        are deliberately excluded here since they're not meant for production
-        use and have caused problems (e.g. non-standard assembly layouts).
+        copied. Uses the newest published stable version (see
+        Get-LatestStableNuGetVersion), and records that version in
+        versions.json so Check for Updates can later tell what's installed.
     #>
     param(
         [Parameter(Mandatory)][string]$PackageId,
@@ -53,12 +95,9 @@ function Get-NuGetPackageDll {
     )
 
     $idLower = $PackageId.ToLowerInvariant()
-    $indexUrl = "https://api.nuget.org/v3-flatcontainer/$idLower/index.json"
 
     Write-Host "Resolving latest stable version of $PackageId ..."
-    $index = Invoke-RestMethod -Uri $indexUrl -UseBasicParsing
-    $stableVersions = $index.versions | Where-Object { $_ -notmatch '-' }
-    $version = if ($stableVersions) { $stableVersions | Select-Object -Last 1 } else { $index.versions | Select-Object -Last 1 }
+    $version = Get-LatestStableNuGetVersion -PackageId $PackageId
 
     $nupkgUrl = "https://api.nuget.org/v3-flatcontainer/$idLower/$version/$idLower.$version.nupkg"
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("nuget_" + [guid]::NewGuid().ToString('N'))
@@ -85,6 +124,7 @@ function Get-NuGetPackageDll {
     }
 
     Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    Set-InstalledPackageVersion -PackageId $PackageId -Version $version
     return $copied
 }
 
@@ -96,22 +136,33 @@ function Initialize-PhoneNumbersLibrary {
         $requiredDlls = @('PhoneNumbers.dll')
     }
     else {
-        # Windows PowerShell 5.1 needs the netstandard2.0 build plus two
-        # small polyfill dependency assemblies.
+        # Windows PowerShell 5.1 needs the netstandard2.0 build, plus its
+        # full transitive dependency chain of small BCL polyfill assemblies
+        # (each in turn depends on the next, dependency-first order here):
+        # System.Runtime.CompilerServices.Unsafe -> System.Buffers /
+        # System.Numerics.Vectors -> System.Memory -> System.Collections.Immutable
+        # -> PhoneNumbers.
         $framework = 'netstandard2.0'
-        $requiredDlls = @('System.Memory.dll', 'System.Collections.Immutable.dll', 'PhoneNumbers.dll')
+        $requiredDlls = @(
+            'System.Runtime.CompilerServices.Unsafe.dll',
+            'System.Buffers.dll',
+            'System.Numerics.Vectors.dll',
+            'System.Memory.dll',
+            'System.Collections.Immutable.dll',
+            'PhoneNumbers.dll'
+        )
     }
+    $script:ResolvedFramework = $framework
+    $script:RequiredDlls = $requiredDlls
 
     $missing = $requiredDlls | Where-Object { -not (Test-Path (Join-Path $script:CacheDir $_)) }
 
     if ($missing) {
         try {
-            Write-Host "One-time setup: downloading offline phone-number library ..."
-            Get-NuGetPackageDll -PackageId 'libphonenumber-csharp' -FrameworkFolder $framework -CacheDir $script:CacheDir | Out-Null
-
-            if (-not $isPS7Plus) {
-                Get-NuGetPackageDll -PackageId 'System.Memory' -FrameworkFolder $framework -CacheDir $script:CacheDir | Out-Null
-                Get-NuGetPackageDll -PackageId 'System.Collections.Immutable' -FrameworkFolder $framework -CacheDir $script:CacheDir | Out-Null
+            Write-Host "One-time setup: downloading offline phone-number library and its dependencies ..."
+            foreach ($dllName in $missing) {
+                $packageId = if ($dllName -eq 'PhoneNumbers.dll') { 'libphonenumber-csharp' } else { [System.IO.Path]::GetFileNameWithoutExtension($dllName) }
+                Get-NuGetPackageDll -PackageId $packageId -FrameworkFolder $framework -CacheDir $script:CacheDir | Out-Null
             }
         }
         catch {
@@ -127,20 +178,27 @@ function Initialize-PhoneNumbersLibrary {
     # Windows PowerShell 5.1 loads assemblies passed to Add-Type via
     # Assembly.LoadFrom, which puts them in the "LoadFrom" binding context.
     # When PhoneNumbers.dll (also loaded that way) then asks the CLR for its
-    # System.Memory / System.Collections.Immutable references, normal probing
-    # runs in a different context and doesn't find them - even though the
-    # files are sitting right there in lib\ - and throws FileNotFoundException.
-    # An AssemblyResolve handler is the standard fix: it catches any bind the
-    # CLR couldn't resolve normally and hands back our cached copy directly,
-    # regardless of exact version or which context asked for it.
+    # dependencies, normal probing runs in a different context and doesn't
+    # find them - even though the files are sitting right there in lib\ -
+    # and throws FileNotFoundException. An AssemblyResolve handler is the
+    # standard fix: it catches any bind the CLR couldn't resolve normally
+    # and hands back our cached copy directly, regardless of exact version
+    # or which context asked for it.
+    #
+    # Self-healing: if a request comes in for a name we haven't already
+    # cached, this assumes (as is true for all the Microsoft BCL polyfill
+    # packages this project depends on) that the NuGet package id matches
+    # the assembly's simple name, and downloads it on demand. This covers
+    # any transitive dependency that wasn't anticipated above, without
+    # needing another round of hardcoding a specific missing DLL.
     #
     # Guarded against re-entrant requests for the same assembly name: if
-    # loading a candidate DLL itself triggers another resolve request for
-    # that same name (seen with some mismatched dependency builds), retrying
-    # would recurse indefinitely and crash with a StackOverflowException,
-    # which can't be caught. Refusing the second request for the same name
-    # breaks that chain; PhoneNumbers.dll will then fail its call cleanly
-    # with a normal, catchable error instead of crashing the process.
+    # loading (or downloading) a candidate DLL itself triggers another
+    # resolve request for that same name, retrying would recurse
+    # indefinitely and crash with a StackOverflowException, which can't be
+    # caught. Refusing the second request for the same name breaks that
+    # chain; the caller will then fail cleanly with a normal, catchable
+    # error instead of crashing the process.
     #
     # Deliberately uses $script: scope rather than local variables/closures:
     # AssemblyResolve is raised by the CLR loader itself, not through
@@ -156,6 +214,12 @@ function Initialize-PhoneNumbersLibrary {
         }
         try {
             $candidatePath = Join-Path $script:CacheDir "$requestedName.dll"
+            if (-not (Test-Path $candidatePath)) {
+                try {
+                    Get-NuGetPackageDll -PackageId $requestedName -FrameworkFolder $script:ResolvedFramework -CacheDir $script:CacheDir | Out-Null
+                }
+                catch { }
+            }
             if (Test-Path $candidatePath) {
                 return [System.Reflection.Assembly]::LoadFrom($candidatePath)
             }
@@ -184,6 +248,7 @@ Initialize-PhoneNumbersLibrary
 $script:PhoneUtil = [PhoneNumbers.PhoneNumberUtil]::GetInstance()
 $script:Geocoder = [PhoneNumbers.PhoneNumberOfflineGeocoder]::GetInstance()
 $script:TimeZoneMapper = [PhoneNumbers.PhoneNumberToTimeZonesMapper]::GetInstance()
+$script:CarrierMapper = [PhoneNumbers.PhoneNumberToCarrierMapper]::GetInstance()
 
 # ------------------------------------------------------------------
 # Country list - United Kingdom and United States pinned to the top,
@@ -278,6 +343,7 @@ function Get-PhoneNumberDetails {
         International = ''
         TimeZones     = ''
         Region        = ''
+        Carrier       = ''
         Notes         = ''
         Error         = ''
     }
@@ -307,6 +373,13 @@ function Get-PhoneNumberDetails {
         }
         catch { }
 
+        $carrierName = ''
+        try {
+            $carrierName = $script:CarrierMapper.GetNameForNumber($parsed, [PhoneNumbers.Locale]::English)
+        }
+        catch { }
+        $result.Carrier = if ([string]::IsNullOrWhiteSpace($carrierName)) { '' } else { $carrierName }
+
         $notes = New-Object System.Collections.Generic.List[string]
         if (-not $isPossible) {
             $notes.Add("Not even a possible number for $CountryName - check the digits and selected country.")
@@ -319,6 +392,9 @@ function Get-PhoneNumberDetails {
         }
         if ($numberTypeRaw -eq 'PREMIUM_RATE') {
             $notes.Add("Premium-rate number - calling or returning this call may incur extra charges.")
+        }
+        if ($result.Carrier) {
+            $notes.Add("Carrier shown is the original block assignment only - if this number has since been ported to another network, it may no longer be accurate.")
         }
         $result.Notes = ($notes -join ' ')
     }
@@ -339,7 +415,7 @@ function Get-PhoneNumberDetails {
 [xml]$mainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Phone Number Validator" Height="640" Width="460"
+        Title="Phone Number Validator" Height="670" Width="460"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         FontFamily="Segoe UI" FontSize="13">
     <Grid Margin="16">
@@ -363,8 +439,9 @@ function Get-PhoneNumberDetails {
 
         <StackPanel Grid.Row="5">
             <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
-                <Button x:Name="CheckButton" Content="Check Number" Height="32" Width="150" Margin="0,0,8,0"/>
-                <Button x:Name="BatchButton" Content="Batch Check..." Height="32" Width="150"/>
+                <Button x:Name="CheckButton" Content="Check Number" Height="32" Width="130" Margin="0,0,8,0"/>
+                <Button x:Name="BatchButton" Content="Batch Check..." Height="32" Width="130" Margin="0,0,8,0"/>
+                <Button x:Name="UpdateButton" Content="Check Updates..." Height="32" Width="130"/>
             </StackPanel>
 
             <TextBlock x:Name="ErrorText" Foreground="Red" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed"/>
@@ -377,6 +454,7 @@ function Get-PhoneNumberDetails {
                         <ColumnDefinition Width="50"/>
                     </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
@@ -402,8 +480,11 @@ function Get-PhoneNumberDetails {
                     <TextBlock Grid.Row="4" Grid.Column="0" Text="Time Zone(s):" FontWeight="SemiBold" Margin="0,0,0,8"/>
                     <TextBlock x:Name="TimeZoneText" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,0,0,8" TextWrapping="Wrap"/>
 
-                    <TextBlock Grid.Row="5" Grid.Column="0" Text="Region:" FontWeight="SemiBold"/>
-                    <TextBlock x:Name="RegionText" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="2" TextWrapping="Wrap"/>
+                    <TextBlock Grid.Row="5" Grid.Column="0" Text="Region:" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                    <TextBlock x:Name="RegionText" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,0,0,8" TextWrapping="Wrap"/>
+
+                    <TextBlock Grid.Row="6" Grid.Column="0" Text="Carrier (original):" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="CarrierText" Grid.Row="6" Grid.Column="1" Grid.ColumnSpan="2" TextWrapping="Wrap"/>
                 </Grid>
             </Border>
 
@@ -465,6 +546,7 @@ $numberBox            = $window.FindName('NumberBox')
 $hintText             = $window.FindName('HintText')
 $checkButton          = $window.FindName('CheckButton')
 $batchButton          = $window.FindName('BatchButton')
+$updateButton         = $window.FindName('UpdateButton')
 $errorText            = $window.FindName('ErrorText')
 $validText            = $window.FindName('ValidText')
 $typeText             = $window.FindName('TypeText')
@@ -472,6 +554,7 @@ $nationalText         = $window.FindName('NationalText')
 $internationalText    = $window.FindName('InternationalText')
 $timeZoneText         = $window.FindName('TimeZoneText')
 $regionText           = $window.FindName('RegionText')
+$carrierText          = $window.FindName('CarrierText')
 $notesText            = $window.FindName('NotesText')
 $copyNationalButton   = $window.FindName('CopyNationalButton')
 $copyInternationalButton = $window.FindName('CopyInternationalButton')
@@ -517,6 +600,7 @@ function Clear-Results {
     $internationalText.Text = ''
     $timeZoneText.Text = ''
     $regionText.Text = ''
+    $carrierText.Text = ''
     $notesText.Text = ''
 }
 
@@ -552,6 +636,7 @@ function Invoke-SingleCheck {
     $internationalText.Text = $details.International
     $timeZoneText.Text = if ($details.TimeZones) { $details.TimeZones } else { '(not available for this number)' }
     $regionText.Text = $details.Region
+    $carrierText.Text = if ($details.Carrier) { $details.Carrier } else { '(no mapping available)' }
     $notesText.Text = $details.Notes
 }
 
@@ -604,6 +689,53 @@ $numberBox.Add_KeyDown({
 })
 
 $checkButton.Add_Click({ Invoke-SingleCheck })
+
+function Invoke-CheckForUpdates {
+    $updateButton.IsEnabled = $false
+    $originalContent = $updateButton.Content
+    $updateButton.Content = 'Checking...'
+    try {
+        $installedVersions = Get-InstalledPackageVersions
+        $updated = New-Object System.Collections.Generic.List[string]
+        $failed = New-Object System.Collections.Generic.List[string]
+
+        foreach ($dllName in $script:RequiredDlls) {
+            $packageId = if ($dllName -eq 'PhoneNumbers.dll') { 'libphonenumber-csharp' } else { [System.IO.Path]::GetFileNameWithoutExtension($dllName) }
+            try {
+                $latest = Get-LatestStableNuGetVersion -PackageId $packageId
+                $current = $installedVersions[$packageId]
+                if (-not $current -or $current -ne $latest) {
+                    Get-NuGetPackageDll -PackageId $packageId -FrameworkFolder $script:ResolvedFramework -CacheDir $script:CacheDir | Out-Null
+                    $fromLabel = if ($current) { $current } else { 'unknown' }
+                    $updated.Add("$packageId`: $fromLabel -> $latest")
+                }
+            }
+            catch {
+                $failed.Add("$packageId - $($_.Exception.Message)")
+            }
+        }
+
+        if ($updated.Count -gt 0) {
+            $message = "Updated:`n" + ($updated -join "`n") + "`n`nRestart the app for the update to take effect."
+        }
+        else {
+            $message = "Already up to date."
+        }
+        if ($failed.Count -gt 0) {
+            $message += "`n`nCouldn't check:`n" + ($failed -join "`n")
+        }
+        [System.Windows.MessageBox]::Show($message, 'Check for Updates') | Out-Null
+    }
+    catch {
+        [System.Windows.MessageBox]::Show("Update check failed: $($_.Exception.Message)", 'Check for Updates') | Out-Null
+    }
+    finally {
+        $updateButton.Content = $originalContent
+        $updateButton.IsEnabled = $true
+    }
+}
+
+$updateButton.Add_Click({ Invoke-CheckForUpdates })
 
 $copyNationalButton.Add_Click({
     if ($nationalText.Text) {

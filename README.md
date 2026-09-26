@@ -28,12 +28,22 @@ checking a list of numbers with CSV export. Built on `libphonenumber-csharp`
   - **Region** — an offline geographic description where the library's data
     supports it (varies by country: city, state/region, or just the country
     name)
+  - **Carrier (original)** — the network the number block was *originally*
+    assigned to (e.g. AT&T, O2). ⚠️ This is NOT a live lookup — see the
+    caveat below, it can be wrong.
   - **Notes** — plain-language flags when relevant: number is not even
     possible for the selected country, is possible-but-not-a-real-range
     (a common trait of spoofed caller ID), is a VoIP line (cheap to spoof,
-    identity unverifiable from the number alone), or is Premium Rate
-    (extra charges to call/return).
+    identity unverifiable from the number alone), is Premium Rate
+    (extra charges to call/return), or a carrier name is shown (reminder
+    that it's original-assignment only).
 - The last country you used is remembered between runs.
+- **Check Updates...** checks nuget.org for newer stable releases of the
+  library and its dependencies, and downloads any that are newer than what's
+  installed. This is manual only — nothing is checked automatically, so the
+  app stays fully offline unless you click it. Prerelease/RC versions are
+  always skipped. Since the assemblies are already loaded once the app is
+  running, restart the app for an update to actually take effect.
 - **Batch Check...** opens a second window: paste a list of numbers (one per
   line, optionally `number,COUNTRYCODE` to override the default country per
   line), run them all at once in a results grid, and export to CSV.
@@ -47,11 +57,15 @@ STIR/SHAKEN attestation), which has no offline equivalent. The Notes field
 above surfaces a couple of honest offline *proxies* (VoIP, possible-but-invalid)
 with plain caveats, rather than pretending to give a verdict.
 
-It also does not show **carrier**, because carrier data only reflects the
-number range's *original* assignment — in the UK, US, and most countries,
-numbers get ported between carriers all the time, so an offline carrier
-lookup is frequently wrong. A live/accurate carrier lookup would require a
-paid API (e.g. Twilio Lookup) that queries the network in real time.
+⚠️ **Carrier is shown, but read the caveat.** It only reflects the number
+block's *original* assignment — in the UK, US, and most countries, numbers
+get ported between carriers all the time, so this can be flat-out wrong for
+a ported number. It's also blind to MVNOs: a number on Mint Mobile (US, runs
+on T-Mobile) or most UK budget networks (which run on O2's or Vodafone's
+infrastructure) will show the *host* network, not the brand you're billed by.
+There is no way to tell from this data alone whether a given result is
+accurate or stale. A live/accurate carrier lookup would require a paid API
+(e.g. Twilio Lookup) that queries the network in real time.
 
 Caller ID name (CNAM) — the business/person name registered against a number
 — is US/Canada-only infrastructure, requires a paid API, and for private
@@ -69,7 +83,7 @@ itself, so lookups never touch the network or read files at runtime.
 ## 🔧 One-Time Setup
 
 The first time you run the script, it downloads the small `libphonenumber-csharp`
-assembly (and, on Windows PowerShell 5.1 only, two small companion .NET
+assembly (and, on Windows PowerShell 5.1 only, a handful of small companion .NET
 assemblies) directly from `nuget.org` into a `lib\` folder next to the
 script. This requires internet access **once**. Every run after that is
 fully offline — nothing is downloaded, and no data ever leaves your machine.
@@ -110,6 +124,13 @@ the dropdown (it drives both the single-check and batch-check dropdowns).
 
 ## 📝 Notes
 
+- On Windows PowerShell 5.1, the one-time setup downloads the full chain of
+  small .NET dependency assemblies the library needs (`System.Memory`,
+  `System.Collections.Immutable`, `System.Buffers`, `System.Numerics.Vectors`,
+  `System.Runtime.CompilerServices.Unsafe`). If a future library update
+  introduces a dependency not in that list, the script will also try to
+  fetch it automatically the first time it's needed, rather than failing -
+  but this needs internet access at that moment to succeed.
 - `libphonenumber-csharp`'s validation/formatting accuracy depends on how
   current its bundled metadata is (Google updates it roughly every two
   weeks). If a very recently-issued number range shows as invalid, that's
