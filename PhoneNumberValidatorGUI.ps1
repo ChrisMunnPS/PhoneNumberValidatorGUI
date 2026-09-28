@@ -18,14 +18,19 @@
     https://github.com/twcclegg/libphonenumber-csharp
 
 .NOTES
+    Version: 1.6.2 - see CHANGELOG.md for version history.
+
     First run requires internet access once, to download the ~1-2 MB
-    libphonenumber-csharp assembly (and, on Windows PowerShell 5.1, two small
-    .NET dependency assemblies) from nuget.org into a local cache folder next
-    to this script. Every run after that is fully offline.
+    libphonenumber-csharp assembly (and, on Windows PowerShell 5.1, its
+    full chain of small .NET dependency assemblies) from nuget.org into a
+    local cache folder next to this script. Every run after that is fully
+    offline unless you click Check Updates.
 #>
 
 [CmdletBinding()]
 param()
+
+$script:AppVersion = '1.6.2'
 
 # ------------------------------------------------------------------
 # Setup: locate / download the libphonenumber-csharp assembly
@@ -200,6 +205,11 @@ function Initialize-PhoneNumbersLibrary {
     # chain; the caller will then fail cleanly with a normal, catchable
     # error instead of crashing the process.
     #
+    $script:KnownDependencyNames = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($dllName in $requiredDlls) {
+        [void]$script:KnownDependencyNames.Add([System.IO.Path]::GetFileNameWithoutExtension($dllName))
+    }
+
     # Deliberately uses $script: scope rather than local variables/closures:
     # AssemblyResolve is raised by the CLR loader itself, not through
     # PowerShell's own event plumbing (unlike WPF's Add_Click), so a plain
@@ -209,6 +219,16 @@ function Initialize-PhoneNumbersLibrary {
     $resolver = [System.ResolveEventHandler] {
         param($resolveSender, $resolveArgs)
         $requestedName = ([System.Reflection.AssemblyName]$resolveArgs.Name).Name
+
+        # AssemblyResolve fires for EVERY unresolved assembly in the whole
+        # process, not just this script's - including PowerShell's own
+        # internal satellite/resource assemblies. Only act on names this
+        # script actually depends on; anything else, leave alone entirely
+        # so PowerShell's own resolution isn't interfered with.
+        if (-not $script:KnownDependencyNames.Contains($requestedName)) {
+            return $null
+        }
+
         if (-not $script:ResolveInProgress.Add($requestedName)) {
             return $null
         }
@@ -301,7 +321,7 @@ $script:TypeLabels = @{
 }
 
 # ------------------------------------------------------------------
-# Settings persistence (remembers last-selected country)
+# Settings persistence (remembers last-selected country and theme)
 # ------------------------------------------------------------------
 
 $script:SettingsPath = Join-Path $PSScriptRoot 'settings.json'
@@ -315,11 +335,172 @@ function Get-SavedSettings {
 }
 
 function Save-Settings {
-    param([string]$LastCountry)
+    <#
+        Merges the given values into settings.json rather than overwriting
+        it, so saving one setting (e.g. theme) doesn't wipe out another
+        (e.g. last country) that isn't being changed in this call.
+    #>
+    param(
+        [string]$LastCountry,
+        [string]$Theme
+    )
     try {
-        @{ LastCountry = $LastCountry } | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+        $existing = Get-SavedSettings
+        $merged = @{
+            LastCountry = if ($PSBoundParameters.ContainsKey('LastCountry')) { $LastCountry } elseif ($existing -and $existing.LastCountry) { $existing.LastCountry } else { $null }
+            Theme       = if ($PSBoundParameters.ContainsKey('Theme')) { $Theme } elseif ($existing -and $existing.Theme) { $existing.Theme } else { $null }
+        }
+        $merged | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
     }
     catch { }
+}
+
+# ------------------------------------------------------------------
+# Theming - Light/Dark colour sets, chosen from Windows' own "Apps use
+# light/dark mode" setting by default, with a manual override the user
+# can flip and which is then remembered.
+#
+# Colours are chosen for WCAG AA contrast (>= 4.5:1 for normal text)
+# against their paired background, not just "make it darker/lighter":
+#   - Body text is a near-black/near-white rather than pure black/white
+#     (softer on the eyes, still very high contrast).
+#   - Status colours (green/red/amber) are shifted lighter for dark mode
+#     and darker for light mode, since the same hex value rarely reads
+#     well against both a white and a near-black background.
+# ------------------------------------------------------------------
+
+function Get-SystemDarkMode {
+    <# Returns $true if Windows' own "Apps use dark mode" setting is on. #>
+    try {
+        $value = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+        return ($value -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function ConvertTo-MediaColor {
+    <#
+        Parses a "#RRGGBB" hex string into a System.Windows.Media.Color.
+        Manual byte parsing rather than ColorConverter/constructor-call
+        syntax, to keep this unambiguous and easy to verify by eye.
+    #>
+    param([Parameter(Mandatory)][string]$HexColor)
+    $hex = $HexColor.TrimStart('#')
+    $r = [Convert]::ToByte($hex.Substring(0, 2), 16)
+    $g = [Convert]::ToByte($hex.Substring(2, 2), 16)
+    $b = [Convert]::ToByte($hex.Substring(4, 2), 16)
+    return [System.Windows.Media.Color]::FromRgb($r, $g, $b)
+}
+
+function Get-ThemeColors {
+    <#
+        Colour choices follow WCAG AA contrast (>= 4.5:1 for normal text,
+        >= 3:1 for UI component borders) against their paired background -
+        ratios noted per line - not a straight colour inversion between
+        the two themes:
+
+        - Dark backgrounds use Material Design's #121212 baseline rather
+          than pure black: pure black next to bright text causes glare/
+          halation and makes the eye work harder, particularly at night.
+        - "Surface" tones for controls and buttons step up in lightness
+          from the base background (elevation), so raised elements read
+          as raised without needing a heavy border.
+        - Status colours (valid/invalid/notes/link) are NOT the same hex
+          value tinted - full-saturation red/green glows uncomfortably on
+          a dark background, so dark mode uses the softer, desaturated
+          Material "300"-weight tones instead of just a brighter version
+          of the light-mode colour.
+    #>
+    param([Parameter(Mandatory)][bool]$IsDark)
+
+    $hexColors = if ($IsDark) {
+        @{
+            AppBackground     = '#121212'  # Material dark baseline (not pure black)
+            AppForeground     = '#E3E3E3'  # ~15.8:1 vs #121212
+            SecondaryText     = '#A0A0A0'  # ~8.4:1 vs #121212 (Material "medium emphasis")
+            ControlBackground = '#1E1E1E'  # elevation +1 surface
+            ControlBorder     = '#5C5C5C'  # ~3.2:1 vs #1E1E1E (meets 3:1 UI-border minimum)
+            ButtonBackground  = '#2A2A2A'  # elevation +2 surface
+            ButtonForeground  = '#E3E3E3'  # ~12.9:1 vs #2A2A2A
+            ButtonBorder      = '#6B6B6B'  # ~3.1:1 vs #2A2A2A
+            AlternateRow      = '#1A1A1A'
+            Valid             = '#81C784'  # Material green300 (desaturated) - ~9:1 vs #121212
+            Invalid           = '#E57373'  # Material red300 (desaturated) - ~7:1 vs #121212
+            Notes             = '#FFB74D'  # Material amber300 - ~10:1 vs #121212
+            Link              = '#64B5F6'  # Material blue300 - ~8:1 vs #121212
+        }
+    }
+    else {
+        @{
+            AppBackground     = '#FFFFFF'
+            AppForeground     = '#1A1A1A'  # ~17.4:1 vs white (near-black, not pure #000)
+            SecondaryText     = '#5F5F5F'  # ~7.0:1 vs white
+            ControlBackground = '#FFFFFF'
+            ControlBorder     = '#8F8F8F'  # ~3.3:1 vs white (meets 3:1 UI-border minimum)
+            ButtonBackground  = '#F0F0F0'
+            ButtonForeground  = '#1A1A1A'  # ~15.6:1 vs #F0F0F0
+            ButtonBorder      = '#949494'  # ~3.0:1 vs #F0F0F0
+            AlternateRow      = '#F2F2F2'
+            Valid             = '#1E7B34'  # ~6.1:1 vs white
+            Invalid           = '#C42B1C'  # ~5.9:1 vs white
+            Notes             = '#8A5300'  # ~5.6:1 vs white
+            Link              = '#0F5FBF'  # ~5.9:1 vs white
+        }
+    }
+
+    $colors = @{}
+    foreach ($key in $hexColors.Keys) {
+        $colors[$key] = ConvertTo-MediaColor -HexColor $hexColors[$key]
+    }
+    return $colors
+}
+
+function Set-WindowTheme {
+    <#
+        Each window's XAML pre-declares its themed brushes directly as
+        Window.Resources (e.g. <SolidColorBrush x:Key="AppForegroundBrush".../>),
+        so they exist the moment the window loads. To switch theme, this
+        mutates each of those EXISTING brush objects' .Color property in
+        place, rather than replacing the Resources dictionary entry with a
+        new brush object.
+
+        This is deliberate, not a style choice: replacing a resource
+        dictionary entry forces WPF to immediately re-validate the new
+        value against every DynamicResource-bound property using it, and
+        that path proved unreliable in this hosting scenario (PowerShell
+        5.1 + Add-Type-loaded WPF), throwing spurious "not a valid value"
+        errors for values that were genuinely valid brushes. Mutating an
+        already-bound brush's Color, by contrast, is the standard/
+        recommended WPF pattern for live theme switching - every element
+        already holds a reference to that exact brush instance, so the
+        colour change just propagates automatically with no re-validation
+        step to go wrong.
+    #>
+    param(
+        [Parameter(Mandatory)]$TargetWindow,
+        [Parameter(Mandatory)][bool]$IsDark
+    )
+    $colors = Get-ThemeColors -IsDark $IsDark
+    foreach ($key in $colors.Keys) {
+        $resourceKey = $key + 'Brush'
+        $existingBrush = $TargetWindow.Resources[$resourceKey]
+        if ($existingBrush) {
+            $existingBrush.Color = $colors[$key]
+        }
+    }
+}
+
+$script:SavedSettingsAtStartup = Get-SavedSettings
+if ($script:SavedSettingsAtStartup -and $script:SavedSettingsAtStartup.Theme -eq 'Dark') {
+    $script:IsDarkMode = $true
+}
+elseif ($script:SavedSettingsAtStartup -and $script:SavedSettingsAtStartup.Theme -eq 'Light') {
+    $script:IsDarkMode = $false
+}
+else {
+    $script:IsDarkMode = Get-SystemDarkMode
 }
 
 # ------------------------------------------------------------------
@@ -415,11 +596,29 @@ function Get-PhoneNumberDetails {
 [xml]$mainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Phone Number Validator" Height="670" Width="460"
+        Title="Phone Number Validator" Height="670" Width="550"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
-        FontFamily="Segoe UI" FontSize="13">
+        FontFamily="Segoe UI" FontSize="13"
+        Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource AppForegroundBrush}">
+    <Window.Resources>
+        <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="AppForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#5F5F5F"/>
+        <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="ControlBorderBrush" Color="#8F8F8F"/>
+        <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#F0F0F0"/>
+        <SolidColorBrush x:Key="ButtonForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="ButtonBorderBrush" Color="#949494"/>
+        <SolidColorBrush x:Key="AlternateRowBrush" Color="#F2F2F2"/>
+        <SolidColorBrush x:Key="ValidBrush" Color="#1E7B34"/>
+        <SolidColorBrush x:Key="InvalidBrush" Color="#C42B1C"/>
+        <SolidColorBrush x:Key="NotesBrush" Color="#8A5300"/>
+        <SolidColorBrush x:Key="LinkBrush" Color="#0F5FBF"/>
+    </Window.Resources>
     <Grid Margin="16">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -428,25 +627,38 @@ function Get-PhoneNumberDetails {
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <TextBlock Grid.Row="0" Text="Country" FontWeight="SemiBold" Margin="0,0,0,4"/>
-        <ComboBox x:Name="CountryCombo" Grid.Row="1" Height="28" Margin="0,0,0,12"/>
+        <CheckBox x:Name="DarkModeCheckBox" Grid.Row="0" Content="Dark Mode" HorizontalAlignment="Right" Margin="0,0,0,8"/>
 
-        <TextBlock Grid.Row="2" Text="Phone Number" FontWeight="SemiBold" Margin="0,0,0,4"/>
-        <TextBox x:Name="NumberBox" Grid.Row="3" Height="28" Margin="0,0,0,4"
-                 VerticalContentAlignment="Center"/>
-        <TextBlock x:Name="HintText" Grid.Row="4"
-                   Foreground="Gray" FontSize="11" Margin="0,0,0,10" TextWrapping="Wrap"/>
+        <TextBlock Grid.Row="1" Text="Country" FontWeight="SemiBold" Margin="0,0,0,4"/>
+        <ComboBox x:Name="CountryCombo" Grid.Row="2" Height="28" Margin="0,0,0,12"
+                  Background="{DynamicResource ControlBackgroundBrush}"
+                  Foreground="{DynamicResource AppForegroundBrush}"
+                  BorderBrush="{DynamicResource ControlBorderBrush}"/>
 
-        <StackPanel Grid.Row="5">
+        <TextBlock Grid.Row="3" Text="Phone Number" FontWeight="SemiBold" Margin="0,0,0,4"/>
+        <TextBox x:Name="NumberBox" Grid.Row="4" Height="28" Margin="0,0,0,4"
+                 VerticalContentAlignment="Center"
+                 Background="{DynamicResource ControlBackgroundBrush}"
+                 Foreground="{DynamicResource AppForegroundBrush}"
+                 BorderBrush="{DynamicResource ControlBorderBrush}"/>
+        <TextBlock x:Name="HintText" Grid.Row="5"
+                   Foreground="{DynamicResource SecondaryTextBrush}" FontSize="11" Margin="0,0,0,10" TextWrapping="Wrap"/>
+
+        <StackPanel Grid.Row="6">
             <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
-                <Button x:Name="CheckButton" Content="Check Number" Height="32" Width="130" Margin="0,0,8,0"/>
-                <Button x:Name="BatchButton" Content="Batch Check..." Height="32" Width="130" Margin="0,0,8,0"/>
-                <Button x:Name="UpdateButton" Content="Check Updates..." Height="32" Width="130"/>
+                <Button x:Name="CheckButton" Content="Check Number" Height="32" Width="130" Margin="0,0,8,0"
+                        Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
+                <Button x:Name="BatchButton" Content="Batch Check..." Height="32" Width="130" Margin="0,0,8,0"
+                        Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
+                <Button x:Name="UpdateButton" Content="Check Updates..." Height="32" Width="130" Margin="0,0,8,0"
+                        Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
+                <Button x:Name="AboutButton" Content="About" Height="32" Width="90"
+                        Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
             </StackPanel>
 
-            <TextBlock x:Name="ErrorText" Foreground="Red" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed"/>
+            <TextBlock x:Name="ErrorText" Foreground="{DynamicResource InvalidBrush}" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed"/>
 
-            <Border BorderBrush="#CCCCCC" BorderThickness="1" Padding="12" CornerRadius="4">
+            <Border BorderBrush="{DynamicResource ControlBorderBrush}" BorderThickness="1" Padding="12" CornerRadius="4">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="130"/>
@@ -471,11 +683,13 @@ function Get-PhoneNumberDetails {
 
                     <TextBlock Grid.Row="2" Grid.Column="0" Text="National Format:" FontWeight="SemiBold" Margin="0,0,0,8"/>
                     <TextBlock x:Name="NationalText" Grid.Row="2" Grid.Column="1" Margin="0,0,0,8"/>
-                    <Button x:Name="CopyNationalButton" Grid.Row="2" Grid.Column="2" Content="Copy" Height="22" Padding="2,0" Margin="4,0,0,8"/>
+                    <Button x:Name="CopyNationalButton" Grid.Row="2" Grid.Column="2" Content="Copy" Height="22" Padding="2,0" Margin="4,0,0,8"
+                            Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
 
                     <TextBlock Grid.Row="3" Grid.Column="0" Text="International:" FontWeight="SemiBold" Margin="0,0,0,8"/>
                     <TextBlock x:Name="InternationalText" Grid.Row="3" Grid.Column="1" Margin="0,0,0,8"/>
-                    <Button x:Name="CopyInternationalButton" Grid.Row="3" Grid.Column="2" Content="Copy" Height="22" Padding="2,0" Margin="4,0,0,8"/>
+                    <Button x:Name="CopyInternationalButton" Grid.Row="3" Grid.Column="2" Content="Copy" Height="22" Padding="2,0" Margin="4,0,0,8"
+                            Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
 
                     <TextBlock Grid.Row="4" Grid.Column="0" Text="Time Zone(s):" FontWeight="SemiBold" Margin="0,0,0,8"/>
                     <TextBlock x:Name="TimeZoneText" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,0,0,8" TextWrapping="Wrap"/>
@@ -488,7 +702,7 @@ function Get-PhoneNumberDetails {
                 </Grid>
             </Border>
 
-            <TextBlock x:Name="NotesText" Foreground="#B36B00" TextWrapping="Wrap" Margin="0,10,0,0" FontSize="12"/>
+            <TextBlock x:Name="NotesText" Foreground="{DynamicResource NotesBrush}" TextWrapping="Wrap" Margin="0,10,0,0" FontSize="12"/>
         </StackPanel>
     </Grid>
 </Window>
@@ -502,7 +716,40 @@ function Get-PhoneNumberDetails {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Batch Phone Number Check" Height="560" Width="760"
-        WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="13">
+        WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="13"
+        Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource AppForegroundBrush}">
+    <Window.Resources>
+        <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="AppForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#5F5F5F"/>
+        <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="ControlBorderBrush" Color="#8F8F8F"/>
+        <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#F0F0F0"/>
+        <SolidColorBrush x:Key="ButtonForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="ButtonBorderBrush" Color="#949494"/>
+        <SolidColorBrush x:Key="AlternateRowBrush" Color="#F2F2F2"/>
+        <SolidColorBrush x:Key="ValidBrush" Color="#1E7B34"/>
+        <SolidColorBrush x:Key="InvalidBrush" Color="#C42B1C"/>
+        <SolidColorBrush x:Key="NotesBrush" Color="#8A5300"/>
+        <SolidColorBrush x:Key="LinkBrush" Color="#0F5FBF"/>
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="{DynamicResource ButtonBackgroundBrush}"/>
+            <Setter Property="Foreground" Value="{DynamicResource AppForegroundBrush}"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+        </Style>
+        <Style TargetType="DataGridCell">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource AppForegroundBrush}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="6,4"/>
+        </Style>
+        <Style TargetType="DataGridRowHeader">
+            <Setter Property="Background" Value="{DynamicResource ControlBackgroundBrush}"/>
+        </Style>
+    </Window.Resources>
     <Grid Margin="16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -517,20 +764,87 @@ function Get-PhoneNumberDetails {
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
             <TextBlock Text="Default country for lines with no country specified:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="DefaultCountryCombo" Width="180"/>
+            <ComboBox x:Name="DefaultCountryCombo" Width="180"
+                      Background="{DynamicResource ControlBackgroundBrush}"
+                      Foreground="{DynamicResource AppForegroundBrush}"
+                      BorderBrush="{DynamicResource ControlBorderBrush}"/>
         </StackPanel>
 
         <TextBox x:Name="BatchInputBox" Grid.Row="2" AcceptsReturn="True" TextWrapping="NoWrap"
-                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" Margin="0,0,0,8"/>
+                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" Margin="0,0,0,8"
+                 Background="{DynamicResource ControlBackgroundBrush}"
+                 Foreground="{DynamicResource AppForegroundBrush}"
+                 BorderBrush="{DynamicResource ControlBorderBrush}"/>
 
         <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button x:Name="RunBatchButton" Content="Run" Width="100" Height="30" Margin="0,0,8,0"/>
-            <Button x:Name="ExportCsvButton" Content="Export to CSV..." Width="140" Height="30"/>
+            <Button x:Name="RunBatchButton" Content="Run" Width="100" Height="30" Margin="0,0,8,0"
+                    Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
+            <Button x:Name="ExportCsvButton" Content="Export to CSV..." Width="140" Height="30"
+                    Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
         </StackPanel>
 
         <DataGrid x:Name="ResultsGrid" Grid.Row="4" AutoGenerateColumns="True" IsReadOnly="True"
-                  CanUserAddRows="False" GridLinesVisibility="Horizontal" AlternatingRowBackground="#F5F5F5"/>
+                  CanUserAddRows="False" GridLinesVisibility="Horizontal"
+                  Background="{DynamicResource ControlBackgroundBrush}"
+                  RowBackground="{DynamicResource ControlBackgroundBrush}"
+                  AlternatingRowBackground="{DynamicResource AlternateRowBrush}"
+                  Foreground="{DynamicResource AppForegroundBrush}"
+                  BorderBrush="{DynamicResource ControlBorderBrush}"
+                  HorizontalGridLinesBrush="{DynamicResource ControlBorderBrush}"
+                  VerticalGridLinesBrush="{DynamicResource ControlBorderBrush}"/>
     </Grid>
+</Window>
+'@
+
+# ------------------------------------------------------------------
+# About window XAML
+# ------------------------------------------------------------------
+
+[xml]$aboutXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="About" Width="420" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        FontFamily="Segoe UI" FontSize="13"
+        Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource AppForegroundBrush}">
+    <Window.Resources>
+        <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="AppForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#5F5F5F"/>
+        <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="ControlBorderBrush" Color="#8F8F8F"/>
+        <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#F0F0F0"/>
+        <SolidColorBrush x:Key="ButtonForegroundBrush" Color="#1A1A1A"/>
+        <SolidColorBrush x:Key="ButtonBorderBrush" Color="#949494"/>
+        <SolidColorBrush x:Key="AlternateRowBrush" Color="#F2F2F2"/>
+        <SolidColorBrush x:Key="ValidBrush" Color="#1E7B34"/>
+        <SolidColorBrush x:Key="InvalidBrush" Color="#C42B1C"/>
+        <SolidColorBrush x:Key="NotesBrush" Color="#8A5300"/>
+        <SolidColorBrush x:Key="LinkBrush" Color="#0F5FBF"/>
+    </Window.Resources>
+    <StackPanel Margin="20">
+        <TextBlock Text="&#128222; Phone Number Validator GUI" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" TextWrapping="Wrap"/>
+        <TextBlock x:Name="AboutVersionText" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,0,0,16"/>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
+                   Text="Offline phone number validation, formatting, and lookup, built on the libphonenumber-csharp library."/>
+
+        <TextBlock Text="Author" FontWeight="SemiBold" Margin="0,0,0,2"/>
+        <TextBlock Text="Chris Munn" Margin="0,0,0,12"/>
+
+        <TextBlock Text="Portfolio" FontWeight="SemiBold" Margin="0,0,0,2"/>
+        <TextBlock Margin="0,0,0,12">
+            <Hyperlink x:Name="PortfolioLink" NavigateUri="https://ChrisMunnPS.github.io" Foreground="{DynamicResource LinkBrush}">https://ChrisMunnPS.github.io</Hyperlink>
+        </TextBlock>
+
+        <TextBlock Text="Repository" FontWeight="SemiBold" Margin="0,0,0,2"/>
+        <TextBlock Margin="0,0,0,20">
+            <Hyperlink x:Name="RepoLink" NavigateUri="https://github.com/ChrisMunnPS/PhoneNumberValidatorGUI" Foreground="{DynamicResource LinkBrush}">https://github.com/ChrisMunnPS/PhoneNumberValidatorGUI</Hyperlink>
+        </TextBlock>
+
+        <Button x:Name="CloseAboutButton" Content="Close" Width="100" Height="30" HorizontalAlignment="Right" Margin="0,0,0,4"
+                Background="{DynamicResource ButtonBackgroundBrush}" Foreground="{DynamicResource ButtonForegroundBrush}" BorderBrush="{DynamicResource ButtonBorderBrush}"/>
+    </StackPanel>
 </Window>
 '@
 
@@ -540,13 +854,17 @@ function Get-PhoneNumberDetails {
 
 $reader = New-Object System.Xml.XmlNodeReader $mainXaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+$window.Title = "Phone Number Validator v$script:AppVersion"
+Set-WindowTheme -TargetWindow $window -IsDark $script:IsDarkMode
 
+$darkModeCheckBox     = $window.FindName('DarkModeCheckBox')
 $countryCombo         = $window.FindName('CountryCombo')
 $numberBox            = $window.FindName('NumberBox')
 $hintText             = $window.FindName('HintText')
 $checkButton          = $window.FindName('CheckButton')
 $batchButton          = $window.FindName('BatchButton')
 $updateButton         = $window.FindName('UpdateButton')
+$aboutButton          = $window.FindName('AboutButton')
 $errorText            = $window.FindName('ErrorText')
 $validText            = $window.FindName('ValidText')
 $typeText             = $window.FindName('TypeText')
@@ -570,6 +888,13 @@ if ($savedSettings -and $savedSettings.LastCountry -and $script:Countries.Contai
     if ($startIndex -lt 0) { $startIndex = 0 }
 }
 $countryCombo.SelectedIndex = $startIndex
+
+$darkModeCheckBox.IsChecked = $script:IsDarkMode
+$darkModeCheckBox.Add_Click({
+    $script:IsDarkMode = $darkModeCheckBox.IsChecked -eq $true
+    Set-WindowTheme -TargetWindow $window -IsDark $script:IsDarkMode
+    Save-Settings -Theme $(if ($script:IsDarkMode) { 'Dark' } else { 'Light' })
+})
 
 function Update-HintText {
     $countryName = $countryCombo.SelectedItem
@@ -630,7 +955,7 @@ function Invoke-SingleCheck {
     }
 
     $validText.Text = if ($details.Valid) { 'Yes' } else { 'No' }
-    $validText.Foreground = if ($details.Valid) { [System.Windows.Media.Brushes]::Green } else { [System.Windows.Media.Brushes]::Red }
+    $validText.Foreground = if ($details.Valid) { $window.Resources['ValidBrush'] } else { $window.Resources['InvalidBrush'] }
     $typeText.Text = $details.NumberType
     $nationalText.Text = $details.National
     $internationalText.Text = $details.International
@@ -756,6 +1081,7 @@ $batchButton.Add_Click({
     $batchReader = New-Object System.Xml.XmlNodeReader $batchXaml
     $batchWindow = [Windows.Markup.XamlReader]::Load($batchReader)
     $batchWindow.Owner = $window
+    Set-WindowTheme -TargetWindow $batchWindow -IsDark $script:IsDarkMode
 
     $defaultCountryCombo = $batchWindow.FindName('DefaultCountryCombo')
     $batchInputBox       = $batchWindow.FindName('BatchInputBox')
@@ -827,6 +1153,36 @@ $batchButton.Add_Click({
     })
 
     $batchWindow.ShowDialog() | Out-Null
+})
+
+# ------------------------------------------------------------------
+# About window logic
+# ------------------------------------------------------------------
+
+$aboutButton.Add_Click({
+    $aboutReader = New-Object System.Xml.XmlNodeReader $aboutXaml
+    $aboutWindow = [Windows.Markup.XamlReader]::Load($aboutReader)
+    $aboutWindow.Owner = $window
+    Set-WindowTheme -TargetWindow $aboutWindow -IsDark $script:IsDarkMode
+
+    $aboutVersionText = $aboutWindow.FindName('AboutVersionText')
+    $portfolioLink    = $aboutWindow.FindName('PortfolioLink')
+    $repoLink         = $aboutWindow.FindName('RepoLink')
+    $closeAboutButton = $aboutWindow.FindName('CloseAboutButton')
+
+    $aboutVersionText.Text = "Version $script:AppVersion"
+
+    $openLinkHandler = {
+        param($linkSender, $navArgs)
+        try { Start-Process -FilePath $navArgs.Uri.AbsoluteUri } catch { }
+        $navArgs.Handled = $true
+    }
+    $portfolioLink.Add_RequestNavigate($openLinkHandler)
+    $repoLink.Add_RequestNavigate($openLinkHandler)
+
+    $closeAboutButton.Add_Click({ $aboutWindow.Close() })
+
+    $aboutWindow.ShowDialog() | Out-Null
 })
 
 $window.ShowDialog() | Out-Null

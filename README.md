@@ -1,5 +1,11 @@
 # 📞 Phone Number Validator GUI
 
+![Version](https://img.shields.io/badge/version-1.6.3-blue)
+![Platform](https://img.shields.io/badge/platform-PowerShell%205.1%20%7C%207%2B-5391FE)
+![Author](https://img.shields.io/badge/author-Chris%20Munn-informational)
+
+**Current version: 1.6.3** — see [CHANGELOG.md](CHANGELOG.md) for full version history.
+
 ## 📋 Executive Summary
 
 A PowerShell + WPF desktop tool for checking whether a phone number is valid,
@@ -44,6 +50,12 @@ checking a list of numbers with CSV export. Built on `libphonenumber-csharp`
   app stays fully offline unless you click it. Prerelease/RC versions are
   always skipped. Since the assemblies are already loaded once the app is
   running, restart the app for an update to actually take effect.
+- **About** shows the app version, author, and links to the portfolio and
+  repository pages (opens in your default browser).
+- **Dark Mode checkbox** defaults to your Windows light/dark setting, and
+  remembers whatever you choose after that. Applies instantly across the
+  main window, Batch Check, and About without a restart. See
+  [🌓 Dark Mode](#-dark-mode) below for the details and known limitations.
 - **Batch Check...** opens a second window: paste a list of numbers (one per
   line, optionally `number,COUNTRYCODE` to override the default country per
   line), run them all at once in a results grid, and export to CSV.
@@ -79,6 +91,45 @@ the C# port of Google's libphonenumber library — the same validation engine
 used by Android, Chrome, and many carriers. All of its metadata (validation
 rules, formatting rules, and geocoding data) is compiled into the assembly
 itself, so lookups never touch the network or read files at runtime.
+
+## 🌓 Dark Mode
+
+Defaults to Windows' own "Apps use light or dark mode" setting the first
+time you run it. After that, whatever you pick in the Dark Mode checkbox is
+remembered in `settings.json` and used on every future launch — it no
+longer auto-follows Windows if the system setting changes later, only
+what you last chose in the app.
+
+The colour palette follows Material Design's dark-theme guidance and
+verified WCAG AA contrast ratios (each colour's ratio against its paired
+background is noted as a comment in the code), not a straight inversion
+between the two themes:
+
+- **Dark backgrounds use `#121212`, not pure black.** Pure black next to
+  bright text causes glare and halation, making the eye work harder —
+  this is the same baseline Material Design uses for its own dark theme.
+- **Body text is near-black / near-white, not pure black/white** — easier
+  on the eyes at typical screen brightness while still comfortably passing
+  WCAG AA (4.5:1+ for normal text).
+- **Controls and buttons step up in lightness from the background**
+  ("elevation"), so raised elements read as raised without needing a
+  heavy border.
+- **Status colours (valid/invalid/notes/link) are genuinely different
+  colours per theme, not a lightened/darkened version of the same hex.**
+  Full-saturation red/green glows uncomfortably on a dark background, so
+  dark mode uses Material's softer "300"-weight tones (e.g. a muted
+  green rather than a bright pure green) while light mode uses deeper,
+  more saturated tones that would look washed out on dark.
+- **Borders meet the 3:1 minimum** WCAG recommends for UI component
+  boundaries (inputs, panels) — not just "any" light gray.
+- Applies live to the main window, Batch Check, and About — no restart
+  needed when you flip it.
+
+**Known limitations:** native OS dialogs (setup/update message boxes) are
+unstyled system dialogs and don't follow the in-app theme, and a few native
+control details (the checkbox's own tick-box outline, older Windows'
+ComboBox dropdown chrome) may not perfectly match — fully overriding those
+needs custom WPF control templates, which was out of scope here.
 
 ## 🔧 One-Time Setup
 
@@ -141,3 +192,12 @@ the dropdown (it drives both the single-check and batch-check dropdowns).
   go, slightly clunky if you edit digits in the middle of an existing entry.
 - Settings (last-used country) are stored in `settings.json` next to the
   script.
+
+## 👤 About
+
+**Author:** Chris Munn
+**Portfolio:** [https://ChrisMunnPS.github.io](https://ChrisMunnPS.github.io)
+**Repository:** [https://github.com/ChrisMunnPS/PhoneNumberValidatorGUI](https://github.com/ChrisMunnPS/PhoneNumberValidatorGUI)
+
+This is also available from within the app itself via the **About** button,
+which links out to the same portfolio and repository pages.
